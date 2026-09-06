@@ -1,0 +1,1924 @@
+# ============================================================================
+# REZA EXECUTION PLATFORM V1.0 - BOT_B (PORT 8788) — XRP SCALP ✅
+# ============================================================================
+#
+# BOT:
+#   REZA BOT V50.7-BOT_B (XRP)
+#
+# EXECUTION:
+#   XT USDT-M FUTURES
+#   XRPUSDT
+#
+# RULES:
+#   - STOP fixed at 1R ✅ (تغییر از 2R)
+#   - SINGLE TP at 0.5R ✅ (تمام پوزیشن در 0.5R بسته می‌شود)
+#   - Breakeven at 0.3R (Stop -> Entry) ✅
+#   - FIXED RISK: هر پوزیشن 0.25$ ✅
+#   - Only ONE position per symbol
+#   - Check for open position BEFORE entry
+#   - Check for open orders BEFORE entry
+#   - Position remains open after session end
+#   - No trailing stop
+#   - SMART TP1 REMOVED (SINGLE TP)
+#
+# ============================================================================
+
+import os
+import json
+import time
+import uuid
+import hmac
+import hashlib
+import logging
+import threading
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+
+import requests
+
+
+# ============================================================================
+# VERSION
+# ============================================================================
+
+VERSION = "V1.0-BOT_B"
+BOT_VERSION = "V50.7-BOT_B"
+
+
+# ============================================================================
+# XT — XRP CONFIG ✅
+# ============================================================================
+
+XT_BASE_URL = "https://fapi.xt.com"
+
+XT_SYMBOL = "xrp_usdt"
+DISPLAY_SYMBOL = "XRPUSDT"
+
+
+# ============================================================================
+# LOCAL LISTENER (PORT 8788) - مخصوص BOT_B
+# ============================================================================
+
+PLATFORM_HOST = "127.0.0.1"
+PLATFORM_PORT = 8788
+
+BOT_SIGNAL_PATH = "/signal"
+
+
+# ============================================================================
+# API KEYS FROM ENVIRONMENT VARIABLES (SECRETS)
+# ============================================================================
+
+def get_api_key():
+    api_key = os.getenv("XT_API_KEY", "").strip()
+    if not api_key:
+        try:
+            with open("/workspaces/.secrets/xt_api_key", "r") as f:
+                api_key = f.read().strip()
+        except:
+            pass
+    return api_key
+
+
+def get_api_secret():
+    api_secret = os.getenv("XT_API_SECRET", "").strip()
+    if not api_secret:
+        try:
+            with open("/workspaces/.secrets/xt_api_secret", "r") as f:
+                api_secret = f.read().strip()
+        except:
+            pass
+    return api_secret
+
+
+# ============================================================================
+# RISK MANAGEMENT — FIXED DOLLAR RISK ✅
+# ============================================================================
+
+USE_FIXED_RISK = True
+FIXED_RISK_USDT = 0.25
+
+
+# ============================================================================
+# ORDER RULES — XRP SCALP (SINGLE TP) ✅
+# ============================================================================
+
+ENTRY_ORDER_TYPE = "MARKET"
+STOP_ORDER_TYPE = "STOP_MARKET"
+TP_ORDER_TYPE = "LIMIT"
+
+STOP_R_MULTIPLE = 1.0          # ✅ استاپ = 1R
+TP_R_MULTIPLE = 0.5            # ✅ TP کامل در 0.5R
+
+# ✅ SINGLE TP - تمام پوزیشن در یک TP بسته می‌شود
+TP_PARTIAL_PERCENT = 0.0
+TP_PARTIAL_R = 0.0
+TP_FULL_R = 0.5                # ✅ 100% پوزیشن در 0.5R
+
+BREAKEVEN_TRIGGER_R = 0.3      # ✅ بریک‌ایون در 0.3R
+
+
+# ============================================================================
+# WEBHOOK TO BOT
+# ============================================================================
+
+BOT_WEBHOOK_ENABLED = True
+BOT_WEBHOOK_URL = "http://127.0.0.1:8765/webhook"
+BOT_WEBHOOK_TIMEOUT = 5
+
+
+# ============================================================================
+# FILES
+# ============================================================================
+
+DATA_DIR = "reza_execution_platform_v1_data_xrp_scalp"
+
+CONFIG_FILE = os.path.join(DATA_DIR, "platform_config.json")
+STATE_FILE = os.path.join(DATA_DIR, "execution_state.json")
+SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "received_signals.jsonl")
+EXECUTION_LOG_FILE = os.path.join(DATA_DIR, "execution_log.jsonl")
+POSITIONS_FILE = os.path.join(DATA_DIR, "active_positions.json")
+
+
+# ============================================================================
+# EXECUTION SAFETY
+# ============================================================================
+
+LIVE_ORDER_EXECUTION = True
+ORDERS_ENABLED = True
+TRADING_ENABLED = True
+
+WITHDRAW_ENABLED = False
+TRANSFER_ENABLED = False
+SPOT_ENABLED = False
+
+
+# ============================================================================
+# XT SIGNATURE
+# ============================================================================
+
+XT_ALGORITHM = "HmacSHA256"
+XT_SIGN_VERSION = "1.0"
+XT_RECV_WINDOW = "5000"
+
+
+# ============================================================================
+# DEFAULT CONFIG
+# ============================================================================
+
+DEFAULT_CONFIG = {
+    "exchange": "XT",
+    "market": "USDT-M FUTURES",
+    "symbol": XT_SYMBOL,
+    "api_key": "",
+    "api_secret": "",
+    "margin_usdt": 4.0,
+    "leverage": 8,
+    "configured": False
+}
+
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("REZA-EXECUTION-XRP-SCALP")
+
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
+state_lock = threading.RLock()
+position_manager_lock = threading.Lock()
+
+state = {
+    "platform_version": VERSION,
+    "bot_version": BOT_VERSION,
+    "symbol": DISPLAY_SYMBOL,
+    "connected_to_bot": False,
+    "xt_private_ready": False,
+    "xt_account_readable": False,
+    "xt_balance": None,
+    "xt_balance_status": "UNKNOWN",
+    "xt_position": None,
+    "xt_position_status": "UNKNOWN",
+    "xt_order_api_status": "UNKNOWN",
+    "last_signal_id": None,
+    "last_signal_time": None,
+    "execution_status": "STARTING",
+    "listener_owner": None,
+    "signal_consumed": False,
+    "entry_confirmed": False,
+    "entry_retry_allowed": True
+}
+
+
+# ============================================================================
+# ACTIVE POSITIONS TRACKING
+# ============================================================================
+
+active_positions = {}
+active_positions_lock = threading.RLock()
+
+
+def load_active_positions():
+    global active_positions
+    try:
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    active_positions = loaded
+                    log.info(f"Loaded {len(active_positions)} active positions")
+    except Exception as exc:
+        log.error(f"Failed to load active positions: {exc}")
+
+
+def save_active_positions():
+    try:
+        with active_positions_lock:
+            with open(POSITIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(active_positions, f, indent=2, default=str)
+    except Exception as exc:
+        log.error(f"Failed to save active positions: {exc}")
+
+
+def add_active_position(signal_id, position_data):
+    with active_positions_lock:
+        active_positions[signal_id] = position_data
+        save_active_positions()
+
+
+def remove_active_position(signal_id):
+    with active_positions_lock:
+        if signal_id in active_positions:
+            del active_positions[signal_id]
+            save_active_positions()
+
+
+def get_active_position(signal_id):
+    with active_positions_lock:
+        return active_positions.get(signal_id)
+
+
+def get_all_active_positions():
+    with active_positions_lock:
+        return dict(active_positions)
+
+
+# ============================================================================
+# HTTP SESSION
+# ============================================================================
+
+http = requests.Session()
+http.headers.update({
+    "User-Agent": "REZA-EXECUTION-PLATFORM-XRP-SCALP",
+    "Accept": "application/json"
+})
+
+
+# ============================================================================
+# TIME
+# ============================================================================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utc_now().isoformat()
+
+
+def format_utc(dt):
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================================
+# FILE SYSTEM
+# ============================================================================
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        log.error("Cannot load %s: %s", path, exc)
+        return default
+
+
+def save_json(path, value):
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False)
+    os.replace(temp, path)
+
+
+def append_jsonl(path, value):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+config = {}
+
+
+def load_configuration():
+    global config
+
+    api_key_env = get_api_key()
+    api_secret_env = get_api_secret()
+
+    if os.path.exists(CONFIG_FILE):
+        config = load_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
+    else:
+        config = dict(DEFAULT_CONFIG)
+
+    if api_key_env:
+        config["api_key"] = api_key_env
+        log.info("✅ API KEY loaded from Environment Variable")
+    
+    if api_secret_env:
+        config["api_secret"] = api_secret_env
+        log.info("✅ API SECRET loaded from Environment Variable")
+    
+    config["symbol"] = XT_SYMBOL
+
+    required = (
+        bool(config.get("api_key"))
+        and bool(config.get("api_secret"))
+    )
+
+    config["configured"] = required
+
+    if required:
+        save_json(CONFIG_FILE, config)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except Exception:
+            pass
+        log.info("✅ Configuration saved to file")
+    else:
+        log.warning("⚠️ Configuration incomplete.")
+
+    return required
+
+
+def first_run_configuration():
+    global config
+
+    print()
+    print("=" * 78)
+    print("REZA EXECUTION PLATFORM — FIRST CONFIGURATION (XRP SCALP)")
+    print("=" * 78)
+    print()
+    print("XT FUTURES: USDT-M")
+    print(f"SYMBOL: {DISPLAY_SYMBOL}")
+    print()
+    print("📊 SCALP CONFIGURATION:")
+    print(f"   - STOP        : 1R")
+    print(f"   - TP          : 0.5R (100% position)")
+    print(f"   - Breakeven   : 0.3R")
+    print(f"   - FIXED RISK  : {FIXED_RISK_USDT}$ per trade")
+    print()
+    print("💡 TIP: You can set these as Environment Variables:")
+    print("   - XT_API_KEY")
+    print("   - XT_API_SECRET")
+    print()
+
+    api_key_env = get_api_key()
+    api_secret_env = get_api_secret()
+
+    if api_key_env and api_secret_env:
+        print("✅ API credentials found in Environment Variables!")
+        config = {
+            "exchange": "XT",
+            "market": "USDT-M FUTURES",
+            "symbol": XT_SYMBOL,
+            "api_key": api_key_env,
+            "api_secret": api_secret_env,
+            "margin_usdt": 4.0,
+            "leverage": 8,
+            "configured": True
+        }
+        save_json(CONFIG_FILE, config)
+        print("Configuration saved from Environment Variables.")
+        return
+
+    api_key = input("XT API KEY: ").strip()
+    if not api_key:
+        raise RuntimeError("XT API KEY cannot be empty.")
+
+    import getpass
+    api_secret = getpass.getpass("XT API SECRET: ").strip()
+    if not api_secret:
+        raise RuntimeError("XT API SECRET cannot be empty.")
+
+    config = {
+        "exchange": "XT",
+        "market": "USDT-M FUTURES",
+        "symbol": XT_SYMBOL,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "margin_usdt": 4.0,
+        "leverage": 8,
+        "configured": True
+    }
+
+    save_json(CONFIG_FILE, config)
+    print("Configuration saved.")
+
+
+# ============================================================================
+# STATE
+# ============================================================================
+
+def load_state():
+    global state
+    loaded = load_json(STATE_FILE, {})
+    if isinstance(loaded, dict):
+        state.update(loaded)
+
+
+def save_state():
+    with state_lock:
+        save_json(STATE_FILE, state)
+
+
+# ============================================================================
+# CONFIG VALIDATION
+# ============================================================================
+
+def validate_configuration():
+    if not config.get("configured", False):
+        raise RuntimeError("Platform configuration is incomplete.")
+    if not config.get("api_key"):
+        raise RuntimeError("XT API KEY is missing.")
+    if not config.get("api_secret"):
+        raise RuntimeError("XT API SECRET is missing.")
+
+
+# ============================================================================
+# XT PARAMETER CANONICALIZATION
+# ============================================================================
+
+def canonical_form(params):
+    if not params:
+        return ""
+    pairs = []
+    for key in sorted(params.keys()):
+        value = params[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        pairs.append(f"{key}={value}")
+    return "&".join(pairs)
+
+
+# ============================================================================
+# XT SIGNATURE
+# ============================================================================
+
+def calculate_xt_signature(api_key, api_secret, timestamp, path, query_string="", body_string=""):
+    x = "xt-validate-appkey=" + str(api_key) + "&xt-validate-timestamp=" + str(timestamp)
+    parts = [path]
+    if query_string:
+        parts.append(query_string)
+    if body_string:
+        parts.append(body_string)
+    y = "#".join(parts)
+    original = x + "#" + y
+    return hmac.new(
+        api_secret.encode("utf-8"),
+        original.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+# ============================================================================
+# XT CLIENT
+# ============================================================================
+
+class XTClient:
+
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = XT_BASE_URL
+
+    def private_headers(self, timestamp, signature):
+        return {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "xt-validate-appkey": self.api_key,
+            "xt-validate-timestamp": timestamp,
+            "xt-validate-signature": signature,
+            "xt-validate-recvwindow": XT_RECV_WINDOW,
+            "xt-validate-algorithms": XT_ALGORITHM,
+            "xt-validate-signversion": XT_SIGN_VERSION
+        }
+
+    def public_get(self, path, params=None):
+        response = http.get(self.base_url + path, params=params or {}, timeout=10)
+        try:
+            data = response.json()
+        except Exception:
+            data = response.text
+        if response.status_code >= 400:
+            raise RuntimeError(f"XT HTTP {response.status_code}: {data}")
+        return data
+
+    def private_get(self, path, params=None):
+        params = params or {}
+        timestamp = str(int(time.time() * 1000))
+        query_string = canonical_form(params)
+        signature = calculate_xt_signature(
+            self.api_key,
+            self.api_secret,
+            timestamp,
+            path,
+            query_string=query_string,
+            body_string=""
+        )
+        headers = self.private_headers(timestamp, signature)
+        response = http.get(self.base_url + path, params=params, headers=headers, timeout=10)
+        try:
+            data = response.json()
+        except Exception:
+            data = response.text
+        if response.status_code >= 400:
+            raise RuntimeError(f"XT HTTP {response.status_code}: {data}")
+        self.check_api_error(data)
+        return data
+
+    def private_post(self, path, params=None):
+        params = params or {}
+        timestamp = str(int(time.time() * 1000))
+        body_string = canonical_form(params)
+        signature = calculate_xt_signature(
+            self.api_key,
+            self.api_secret,
+            timestamp,
+            path,
+            query_string="",
+            body_string=body_string
+        )
+        headers = self.private_headers(timestamp, signature)
+        response = http.post(self.base_url + path, data=body_string, headers=headers, timeout=10)
+        try:
+            data = response.json()
+        except Exception:
+            data = response.text
+        if response.status_code >= 400:
+            raise RuntimeError(f"XT HTTP {response.status_code}: {data}")
+        self.check_api_error(data)
+        return data
+
+    @staticmethod
+    def check_api_error(data):
+        if not isinstance(data, dict):
+            return
+        rc = data.get("returnCode")
+        if rc not in (None, 0, "0"):
+            raise RuntimeError(f"XT API error: {data}")
+
+    def get_account(self):
+        return self.private_get("/future/user/v1/account/info")
+
+    def get_balance(self):
+        return self.private_get("/future/user/v1/balance/list")
+
+    def get_balance_detail(self):
+        return self.private_get("/future/user/v1/balance/detail", {"coin": "usdt"})
+
+    def get_position(self):
+        return self.private_get("/future/user/v1/position/list", {"symbol": XT_SYMBOL})
+
+    def get_open_orders(self):
+        return self.private_get(
+            "/future/trade/v1/order/list-open",
+            {"symbol": XT_SYMBOL}
+        )
+
+    def get_order_history(self):
+        return self.private_get(
+            "/future/trade/v1/order/list-history",
+            {"symbol": XT_SYMBOL, "direction": "NEXT", "limit": 10}
+        )
+
+    def get_symbol_detail(self):
+        return self.public_get("/future/market/v1/public/symbol/detail", {"symbol": XT_SYMBOL})
+
+    def normalize_price(self, price):
+        if price is None:
+            raise ValueError("Price cannot be None.")
+        price_decimal = Decimal(str(price))
+        if price_decimal <= 0:
+            raise ValueError(f"Invalid price: {price}")
+
+        response = self.get_symbol_detail()
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Invalid XT symbol detail response: {response}")
+
+        result = response.get("result")
+        symbol_info = None
+
+        if isinstance(result, list):
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("symbol", "")).lower() == XT_SYMBOL.lower():
+                    symbol_info = item
+                    break
+        elif isinstance(result, dict):
+            symbol_info = result
+
+        if not isinstance(symbol_info, dict):
+            raise RuntimeError(f"XT symbol detail missing for {XT_SYMBOL}: {response}")
+
+        price_precision = symbol_info.get("pricePrecision")
+        if price_precision is None:
+            raise RuntimeError(f"XT pricePrecision missing for {XT_SYMBOL}: {symbol_info}")
+
+        price_precision = int(price_precision)
+        quantizer = Decimal("1").scaleb(-price_precision)
+        normalized_price = price_decimal.quantize(quantizer, rounding=ROUND_DOWN)
+        normalized_price_xt = format(normalized_price, "f")
+
+        log.warning(
+            "XT PRICE NORMALIZED: input=%s precision=%s normalized=%s",
+            price, price_precision, normalized_price_xt
+        )
+
+        return normalized_price_xt
+
+    def get_mark_price(self):
+        return self.public_get("/future/market/v1/public/q/symbol-mark-price", {"symbol": XT_SYMBOL})
+
+    def get_contract_size(self):
+        detail = self.get_symbol_detail()
+        result = detail.get("result", {}) if isinstance(detail, dict) else {}
+        return float(result.get("contractSize", 0) or 0)
+
+    def get_quantity_step(self):
+        detail = self.get_symbol_detail()
+        result = detail.get("result", {}) if isinstance(detail, dict) else {}
+
+        step = None
+        candidates = [
+            result.get("quantityPrecision"),
+            result.get("basePrecision"),
+            result.get("stepSize"),
+            result.get("minQty")
+        ]
+
+        for candidate in candidates:
+            if isinstance(candidate, (int, float)):
+                value = float(candidate)
+                if 0 < value < 1:
+                    step = value
+                    break
+
+        if step is None:
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                try:
+                    value = Decimal(str(candidate))
+                    if 0 < value < 1:
+                        step = value
+                        break
+                except Exception:
+                    pass
+
+        if step is None:
+            precision = result.get("quantityPrecision")
+            if isinstance(precision, int) and precision >= 0:
+                step = 10 ** (-precision)
+
+        if step is None:
+            step = 1.0
+
+        return float(step)
+
+    def get_latest_price(self):
+        response = self.public_get("/future/market/v1/public/q/agg-ticker", {"symbol": XT_SYMBOL})
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Invalid ticker response: {response}")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Invalid ticker result: {response}")
+        price = result.get("c")
+        if price is None:
+            raise RuntimeError(f"XT latest price missing: {response}")
+        return float(price)
+
+    def create_market_entry(self, direction, quantity):
+        side = "BUY" if direction == "LONG" else "SELL"
+        quantity_decimal = Decimal(str(quantity))
+        if quantity_decimal == quantity_decimal.to_integral_value():
+            quantity_xt = str(int(quantity_decimal))
+        else:
+            quantity_xt = format(quantity_decimal, "f").rstrip("0").rstrip(".")
+
+        params = {
+            "symbol": XT_SYMBOL,
+            "orderSide": side,
+            "orderType": "MARKET",
+            "origQty": quantity_xt,
+            "timeInForce": "IOC",
+            "positionSide": direction
+        }
+
+        log.warning("REAL XT MARKET ORDER REQUEST: side=%s quantity=%s", side, quantity_xt)
+        return self.private_post("/future/trade/v1/order/create", params)
+
+    def create_stop_market(self, direction, quantity, stop_price):
+        side = "SELL" if direction == "LONG" else "BUY"
+        quantity_decimal = Decimal(str(quantity))
+        if quantity_decimal == quantity_decimal.to_integral_value():
+            quantity_xt = str(int(quantity_decimal))
+        else:
+            quantity_xt = format(quantity_decimal, "f").rstrip("0").rstrip(".")
+
+        try:
+            mark_response = self.get_mark_price()
+            current_xt_price = None
+            if isinstance(mark_response, dict):
+                result = mark_response.get("result")
+                if isinstance(result, dict):
+                    current_xt_price = result.get("markPrice") or result.get("price") or result.get("lastPrice")
+                elif isinstance(result, list) and result:
+                    item = result[0]
+                    if isinstance(item, dict):
+                        current_xt_price = item.get("markPrice") or item.get("price") or item.get("lastPrice")
+            if current_xt_price is not None:
+                current_xt_price = float(current_xt_price)
+        except Exception as exc:
+            log.warning("XT MARK PRICE READ FAILED BEFORE STOP: %s", exc)
+            current_xt_price = None
+
+        if current_xt_price is not None:
+            if direction == "LONG" and stop_price >= current_xt_price:
+                raise RuntimeError(f"INVALID LONG STOP: stop={stop_price} current_xt={current_xt_price}")
+            if direction == "SHORT" and stop_price <= current_xt_price:
+                raise RuntimeError(f"INVALID SHORT STOP: stop={stop_price} current_xt={current_xt_price}")
+
+        normalized_stop_price = self.normalize_price(stop_price)
+        params = {
+            "symbol": XT_SYMBOL,
+            "orderSide": side,
+            "entrustType": "STOP_MARKET",
+            "origQty": quantity_xt,
+            "stopPrice": normalized_stop_price,
+            "timeInForce": "IOC",
+            "triggerPriceType": "LATEST_PRICE",
+            "positionSide": direction
+        }
+
+        log.warning("XT STOP MARKET REQUEST: direction=%s side=%s quantity=%s stopPrice=%s",
+                   direction, side, quantity_xt, normalized_stop_price)
+        return self.private_post("/future/trade/v1/entrust/create-plan", params)
+
+    def create_take_profit_limit(self, direction, quantity, tp_price, reduce_only=True):
+        side = "SELL" if direction == "LONG" else "BUY"
+        
+        quantity_decimal = Decimal(str(quantity))
+        if quantity_decimal == quantity_decimal.to_integral_value():
+            quantity_xt = str(int(quantity_decimal))
+        else:
+            quantity_xt = format(quantity_decimal, "f").rstrip("0").rstrip(".")
+        
+        normalized_tp_price = self.normalize_price(tp_price)
+        
+        try:
+            mark_response = self.get_mark_price()
+            current_price = None
+            if isinstance(mark_response, dict):
+                result = mark_response.get("result")
+                if isinstance(result, dict):
+                    current_price = result.get("markPrice") or result.get("price") or result.get("lastPrice")
+                elif isinstance(result, list) and result:
+                    item = result[0]
+                    if isinstance(item, dict):
+                        current_price = item.get("markPrice") or item.get("price") or item.get("lastPrice")
+            
+            if current_price is not None:
+                current_price = float(current_price)
+                if direction == "LONG" and tp_price <= current_price:
+                    log.warning("LONG TP is not above current price: tp=%s current=%s", tp_price, current_price)
+                if direction == "SHORT" and tp_price >= current_price:
+                    log.warning("SHORT TP is not below current price: tp=%s current=%s", tp_price, current_price)
+        except Exception as exc:
+            log.warning("Could not validate TP price: %s", exc)
+
+        params = {
+            "symbol": XT_SYMBOL,
+            "orderSide": side,
+            "orderType": "LIMIT",
+            "origQty": quantity_xt,
+            "price": normalized_tp_price,
+            "timeInForce": "GTC",
+            "positionSide": direction,
+            "reduceOnly": reduce_only
+        }
+
+        log.warning("XT TAKE PROFIT LIMIT REQUEST: direction=%s side=%s quantity=%s tpPrice=%s reduceOnly=%s",
+                   direction, side, quantity_xt, normalized_tp_price, reduce_only)
+        return self.private_post("/future/trade/v1/order/create", params)
+
+    def cancel_order(self, order_id):
+        if order_id is None:
+            return True
+        
+        try:
+            order_id_int = int(order_id)
+        except (ValueError, TypeError):
+            order_id_int = order_id
+            
+        response = self.private_post("/future/trade/v1/order/cancel", {"orderId": order_id_int})
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Invalid cancel response: {response}")
+        return response
+
+    def close_position_market(self, direction, quantity):
+        direction = str(direction).upper()
+        if direction == "LONG":
+            order_side = "SELL"
+        elif direction == "SHORT":
+            order_side = "BUY"
+        else:
+            raise RuntimeError(f"Invalid direction: {direction}")
+
+        quantity_decimal = Decimal(str(quantity))
+        if quantity_decimal == quantity_decimal.to_integral_value():
+            quantity_xt = str(int(quantity_decimal))
+        else:
+            quantity_xt = format(quantity_decimal, "f").rstrip("0").rstrip(".")
+
+        response = self.private_post(
+            "/future/trade/v1/order/create",
+            {
+                "symbol": XT_SYMBOL,
+                "orderSide": order_side,
+                "orderType": "MARKET",
+                "origQty": quantity_xt,
+                "reduceOnly": True,
+                "positionSide": direction
+            }
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Invalid close response: {response}")
+        return response
+
+
+# ============================================================================
+# IMPROVED ORDER ID EXTRACTION
+# ============================================================================
+
+def extract_order_id(response):
+    if not isinstance(response, dict):
+        return None
+
+    for key in ["orderId", "orderID", "id", "entrustId", "entrustID", "order_id"]:
+        if key in response and response[key] is not None:
+            return str(response[key])
+
+    result = response.get("result")
+    if result is not None:
+        if isinstance(result, (str, int)):
+            return str(result)
+        if isinstance(result, dict):
+            for key in ["orderId", "orderID", "id", "entrustId", "entrustID", "order_id"]:
+                if key in result and result[key] is not None:
+                    return str(result[key])
+            if "list" in result and isinstance(result["list"], list) and result["list"]:
+                first = result["list"][0]
+                if isinstance(first, dict):
+                    for key in ["orderId", "orderID", "id", "entrustId", "entrustID"]:
+                        if key in first and first[key] is not None:
+                            return str(first[key])
+
+    return None
+
+
+# ============================================================================
+# IMPROVED POSITION EXTRACTION
+# ============================================================================
+
+def extract_positions(response):
+    if not isinstance(response, dict):
+        return []
+
+    result = response.get("result")
+    if result is None:
+        return []
+
+    if isinstance(result, list):
+        return result
+
+    if isinstance(result, dict):
+        positions = result.get("list")
+        if isinstance(positions, list):
+            return positions
+        if "positionSize" in result:
+            return [result]
+
+    return []
+
+
+def find_active_position(positions):
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        try:
+            size = float(position.get("positionSize", 0) or 0)
+        except Exception:
+            size = 0
+        if size > 0:
+            return position
+    return None
+
+
+def extract_usdt_balance(response):
+    if not isinstance(response, dict):
+        return None
+
+    result = response.get("result")
+    if not isinstance(result, list):
+        return None
+
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("coin", "")).lower() != "usdt":
+            continue
+        value = item.get("availableBalance")
+        if value is None:
+            value = item.get("walletBalance")
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    return None
+
+
+# ============================================================================
+# ✅ CHECK OPEN POSITION FOR SYMBOL
+# ============================================================================
+
+def has_open_position_for_symbol():
+    try:
+        position_response = xt.get_position()
+        positions = extract_positions(position_response)
+        actual = find_active_position(positions)
+        
+        if actual:
+            size = float(actual.get("positionSize", 0) or 0)
+            if size > 0:
+                log.info(f"⚠️ OPEN POSITION EXISTS for {DISPLAY_SYMBOL}: side={actual.get('positionSide')} size={size}")
+                return True, actual
+        return False, None
+        
+    except Exception as exc:
+        log.error(f"Failed to check position: {exc}")
+        return False, None
+
+
+# ============================================================================
+# ✅ CHECK OPEN ORDERS FOR SYMBOL
+# ============================================================================
+
+def has_open_orders_for_symbol():
+    try:
+        orders_response = xt.get_open_orders()
+        
+        if not isinstance(orders_response, dict):
+            return False, None
+        
+        result = orders_response.get("result")
+        if not isinstance(result, list):
+            return False, None
+        
+        for order in result:
+            if not isinstance(order, dict):
+                continue
+            order_symbol = str(order.get("symbol", "")).lower()
+            if order_symbol == XT_SYMBOL.lower():
+                order_id = order.get("orderId") or order.get("id")
+                log.info(f"⚠️ OPEN ORDER EXISTS for {DISPLAY_SYMBOL}: order_id={order_id}")
+                return True, order
+        
+        return False, None
+        
+    except Exception as exc:
+        log.error(f"Failed to check open orders: {exc}")
+        return False, None
+
+
+# ============================================================================
+# GLOBAL XT CLIENT
+# ============================================================================
+
+xt = None
+
+
+# ============================================================================
+# SIGNAL VALIDATION
+# ============================================================================
+
+REQUIRED_SIGNAL_FIELDS = [
+    "signal_id",
+    "direction",
+    "reference_entry",
+    "initial_risk",
+]
+
+
+def validate_signal(signal):
+    if not isinstance(signal, dict):
+        raise ValueError("Signal must be a JSON object.")
+
+    required = ["signal_id", "direction", "reference_entry", "initial_risk"]
+    for field in required:
+        if field not in signal:
+            raise ValueError(f"Signal missing field: {field}")
+
+    if signal["direction"] not in ("LONG", "SHORT"):
+        raise ValueError("Invalid direction.")
+
+    if float(signal["initial_risk"]) <= 0:
+        raise ValueError("Invalid R value.")
+
+    return True
+
+
+# ============================================================================
+# SIGNAL DISPLAY
+# ============================================================================
+
+def display_signal(signal):
+    print()
+    print("=" * 78)
+    print(f"🔥 REZA BOT — SIGNAL RECEIVED ({DISPLAY_SYMBOL} - SCALP)")
+    print("=" * 78)
+    print(f"SIGNAL ID       : {signal['signal_id']}")
+    print(f"DIRECTION       : {signal['direction']}")
+    print(f"REFERENCE ENTRY : {signal['reference_entry']:.4f}")
+    print(f"INITIAL RISK    : {signal['initial_risk']:.4f}")
+    
+    print()
+    print("📊 SCALP CONFIGURATION:")
+    print(f"  - STOP        : 1R (Fixed)")
+    print(f"  - TP          : 0.5R (100% position) ✅")
+    print(f"  - Breakeven   : 0.3R (Stop -> Entry)")
+    print(f"  - FIXED RISK  : {FIXED_RISK_USDT}$ per trade")
+    
+    if signal.get("hyper_high"):
+        print(f"HYPER HIGH      : {signal['hyper_high']:.4f}")
+    if signal.get("hyper_low"):
+        print(f"HYPER LOW       : {signal['hyper_low']:.4f}")
+    
+    print()
+    print("SOURCE          : XT (DATA) + XT (EXECUTION)")
+    print(f"EXECUTION       : XT {DISPLAY_SYMBOL} FUTURES")
+    print("ENTRY           : REAL MARKET / TAKER")
+    print("STOP            : STOP_MARKET")
+    print("TP              : LIMIT (LOWER FEES)")
+    print("=" * 78)
+    print()
+
+
+# ============================================================================
+# WEBHOOK TO BOT
+# ============================================================================
+
+def send_webhook_to_bot(event, data):
+    if not BOT_WEBHOOK_ENABLED:
+        return True
+    
+    try:
+        payload = {
+            "event": event,
+            "signal_id": data.get("signal_id"),
+            "direction": data.get("direction"),
+            "entry_price": data.get("entry"),
+        }
+        
+        if "exit_price" in data:
+            payload["exit_price"] = data["exit_price"]
+        if "pnl" in data:
+            payload["pnl"] = data["pnl"]
+        if "pnl_percent" in data:
+            payload["pnl_percent"] = data["pnl_percent"]
+        if "reason" in data:
+            payload["reason"] = data["reason"]
+        if "total_r" in data:
+            payload["total_r"] = data["total_r"]
+        if "close_time" in data:
+            payload["close_time"] = data["close_time"]
+        
+        response = requests.post(
+            BOT_WEBHOOK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=BOT_WEBHOOK_TIMEOUT
+        )
+        
+        if response.status_code >= 400:
+            log.error("WEBHOOK TO BOT failed: HTTP %s", response.status_code)
+            return False
+        
+        log.info("WEBHOOK TO BOT sent: event=%s signal_id=%s", event, data.get("signal_id"))
+        return True
+        
+    except Exception as exc:
+        log.error("WEBHOOK TO BOT error: %s", exc)
+        return False
+
+
+# ============================================================================
+# ✅ FIXED RISK POSITION SIZING
+# ============================================================================
+
+def calculate_position_size(entry_price, stop_price, direction):
+    if not USE_FIXED_RISK:
+        return get_order_quantity_legacy()
+    
+    if direction == "LONG":
+        risk_distance = abs(entry_price - stop_price)
+    else:
+        risk_distance = abs(stop_price - entry_price)
+    
+    if risk_distance <= 0:
+        raise RuntimeError("Invalid risk distance for position sizing.")
+    
+    raw_quantity = FIXED_RISK_USDT / risk_distance
+    
+    step = xt.get_quantity_step()
+    quantity_decimal = Decimal(str(raw_quantity))
+    step_decimal = Decimal(str(step))
+    units = quantity_decimal / step_decimal
+    quantity = float(units.to_integral_value(rounding=ROUND_DOWN) * step_decimal)
+    
+    if quantity <= 0:
+        quantity = step
+    
+    mark_price_value = xt.get_latest_price()
+    contract_size = xt.get_contract_size()
+    notional_value = quantity * mark_price_value * contract_size
+    
+    required_margin = FIXED_RISK_USDT
+    leverage = notional_value / required_margin if required_margin > 0 else 1
+    
+    log.info(f"📊 FIXED RISK SIZING: risk=${FIXED_RISK_USDT}, "
+             f"stop_distance={risk_distance:.4f}, quantity={quantity:.4f}, "
+             f"notional=${notional_value:.2f}, leverage={leverage:.1f}x")
+    
+    return {
+        "quantity": quantity,
+        "margin": required_margin,
+        "leverage": min(leverage, 50),
+        "quantity_step": step,
+        "mark_price": mark_price_value,
+        "contract_size": contract_size,
+        "risk_usdt": FIXED_RISK_USDT,
+        "stop_distance": risk_distance
+    }
+
+
+def get_order_quantity_legacy():
+    detail = xt.get_symbol_detail()
+    result = detail.get("result", {}) if isinstance(detail, dict) else {}
+
+    contract_size = float(result.get("contractSize", 0) or 0)
+    if contract_size <= 0:
+        raise RuntimeError("XT contractSize unavailable.")
+
+    mark_price = xt.get_latest_price()
+
+    margin = float(config.get("margin_usdt", 4.0))
+    leverage = int(config.get("leverage", 8))
+
+    raw_quantity = margin * leverage / (mark_price * contract_size)
+
+    step = xt.get_quantity_step()
+
+    raw_decimal = Decimal(str(raw_quantity))
+    step_decimal = Decimal(str(step))
+
+    if step_decimal <= 0:
+        raise RuntimeError("Invalid XT quantity step.")
+
+    units = raw_decimal / step_decimal
+    units_up = units.to_integral_value(rounding=ROUND_UP)
+    quantity_decimal = units_up * step_decimal
+
+    if quantity_decimal <= 0:
+        raise RuntimeError(f"Calculated XT order quantity is zero.")
+
+    quantity = float(quantity_decimal)
+    return {
+        "quantity": quantity,
+        "mark_price": mark_price,
+        "contract_size": contract_size,
+        "quantity_step": float(step_decimal),
+        "margin": margin,
+        "leverage": leverage,
+        "risk_usdt": margin
+    }
+
+
+def get_order_quantity(entry_price=None, stop_price=None, direction=None):
+    if USE_FIXED_RISK and entry_price is not None and stop_price is not None:
+        return calculate_position_size(entry_price, stop_price, direction)
+    return get_order_quantity_legacy()
+
+
+# ============================================================================
+# POSITION MANAGEMENT — SCALP (SINGLE TP) ✅
+# ============================================================================
+
+POSITION_MANAGER_INTERVAL = 1.0
+position_manager_started = False
+position_manager_shutdown = False
+
+
+def position_still_open(direction):
+    positions_response = xt.get_position()
+    positions = extract_positions(positions_response)
+    actual = find_active_position(positions)
+
+    if not actual:
+        return False, None
+
+    symbol = str(actual.get("symbol", "")).lower()
+    actual_side = str(actual.get("positionSide", "")).upper()
+
+    try:
+        size = float(actual.get("positionSize", 0) or 0)
+    except Exception:
+        size = 0
+
+    if symbol != XT_SYMBOL.lower():
+        return False, None
+
+    if actual_side != str(direction).upper():
+        return False, None
+
+    if size <= 0:
+        return False, None
+
+    return True, actual
+
+
+def cancel_protection_orders(stop_order_id, tp_order_id):
+    errors = []
+    for order_id in (stop_order_id, tp_order_id):
+        if order_id is None:
+            continue
+        try:
+            xt.cancel_order(order_id)
+        except Exception as exc:
+            errors.append(f"{order_id}: {exc}")
+
+    if errors:
+        log.warning(f"Protection cancellation errors: {errors}")
+
+
+def manage_single_position(signal_id, position_data):
+    try:
+        direction = str(position_data.get("direction", "")).upper()
+        entry = float(position_data.get("entry", 0))
+        risk_r = float(position_data.get("risk_R", 0))
+        total_quantity = float(position_data.get("quantity", 0))
+        stop_order_id = position_data.get("stop_order_id")
+        tp_order_id = position_data.get("tp_order_id")
+        stage = int(position_data.get("management_stage", 0))
+        
+        # ✅ SINGLE TP - تمام پوزیشن در TP بسته می‌شود
+        tp_price = entry + (risk_r * TP_FULL_R) if direction == "LONG" else entry - (risk_r * TP_FULL_R)
+        breakeven_trigger = entry + (risk_r * BREAKEVEN_TRIGGER_R) if direction == "LONG" else entry - (risk_r * BREAKEVEN_TRIGGER_R)
+
+        is_open, actual = position_still_open(direction)
+        if not is_open:
+            remove_active_position(signal_id)
+            return
+
+        market_price = xt.get_latest_price()
+
+        # ============================================================
+        # ✅ مرحله 1: بریک‌ایون در 0.3R
+        # ============================================================
+        if stage == 0:
+            if (direction == "LONG" and market_price >= breakeven_trigger) or \
+               (direction == "SHORT" and market_price <= breakeven_trigger):
+                
+                log.info(f"✅ Position {signal_id} reached {BREAKEVEN_TRIGGER_R}R - BREAKEVEN ACTIVATED")
+                
+                cancel_protection_orders(stop_order_id, tp_order_id)
+                
+                new_stop_response = xt.create_stop_market(direction, total_quantity, entry)
+                new_stop_order_id = extract_order_id(new_stop_response)
+                
+                position_data.update({
+                    "stop_order_id": new_stop_order_id,
+                    "stop": entry,
+                    "management_stage": 1,
+                    "breakeven_trigger_price": breakeven_trigger
+                })
+                add_active_position(signal_id, position_data)
+                return
+
+        # ============================================================
+        # ✅ مرحله 2: TP کامل (100% در 0.5R)
+        # ============================================================
+        if (direction == "LONG" and market_price >= tp_price) or \
+           (direction == "SHORT" and market_price <= tp_price):
+            
+            log.info(f"✅ Position {signal_id} reached TP ({TP_FULL_R}R) - 100% CLOSED")
+            
+            remove_active_position(signal_id)
+            
+            append_jsonl(EXECUTION_LOG_FILE, {
+                "time": iso_now(),
+                "event": "POSITION_CLOSED_FULL_TP",
+                "signal_id": signal_id,
+                "direction": direction,
+                "entry": entry,
+                "tp_price": tp_price,
+                "total_r": TP_FULL_R
+            })
+            
+            send_webhook_to_bot("POSITION_CLOSED", {
+                "signal_id": signal_id,
+                "direction": direction,
+                "entry": entry,
+                "exit_price": tp_price,
+                "reason": "TP_FULL_PROFIT",
+                "total_r": TP_FULL_R
+            })
+            return
+
+    except Exception as exc:
+        log.error(f"Error managing position {signal_id}: {exc}")
+
+
+def position_manager_loop():
+    global position_manager_shutdown
+
+    log.info("=" * 78)
+    log.info(f"📌 POSITION MANAGEMENT: SCALP (SINGLE TP) ✅")
+    log.info(f"   - STOP        : 1R (Fixed)")
+    log.info(f"   - TP          : 0.5R (100% position)")
+    log.info(f"   - Breakeven   : 0.3R (Stop -> Entry)")
+    log.info(f"   - FIXED RISK  : {FIXED_RISK_USDT}$ per trade")
+    log.info("=" * 78)
+
+    while not position_manager_shutdown:
+        try:
+            positions = get_all_active_positions()
+            
+            if positions:
+                for signal_id, position_data in positions.items():
+                    manage_single_position(signal_id, position_data)
+
+        except Exception as exc:
+            log.error(f"Position manager error: {exc}")
+
+        time.sleep(POSITION_MANAGER_INTERVAL)
+
+
+def start_position_manager():
+    global position_manager_started
+    with position_manager_lock:
+        if position_manager_started:
+            return
+        position_manager_started = True
+        
+        thread = threading.Thread(
+            target=position_manager_loop,
+            daemon=True,
+            name="REZA-POSITION-MANAGER-XRP-SCALP"
+        )
+        thread.start()
+
+
+# ============================================================================
+# XT CONNECTION TEST
+# ============================================================================
+
+def test_xt_connection():
+    global xt
+
+    print()
+    print("=" * 78)
+    print(f"XT FUTURES PRIVATE API TEST ({DISPLAY_SYMBOL} - SCALP)")
+    print("=" * 78)
+
+    private_ok = False
+    available = None
+
+    try:
+        response = xt.get_account()
+        private_ok = True
+        print("XT ACCOUNT         : OK")
+    except Exception as exc:
+        print(f"XT ACCOUNT         : ERROR - {exc}")
+
+    try:
+        response = xt.get_balance()
+        available = extract_usdt_balance(response)
+        print(f"XT AVAILABLE USDT  : {available}")
+    except Exception as exc:
+        print(f"XT BALANCE         : ERROR - {exc}")
+
+    try:
+        response = xt.get_position()
+        positions = extract_positions(response)
+        with state_lock:
+            state["xt_position"] = positions
+            state["xt_position_status"] = "OK"
+        print("XT POSITION API    : OK")
+    except Exception as exc:
+        print(f"XT POSITION API    : ERROR - {exc}")
+        with state_lock:
+            state["xt_position_status"] = "ERROR"
+
+    with state_lock:
+        state["xt_private_ready"] = private_ok
+        state["xt_account_readable"] = private_ok
+        state["xt_balance"] = available
+        state["xt_balance_status"] = "OK" if available is not None else "ERROR"
+
+    save_state()
+
+    return private_ok
+
+
+# ============================================================================
+# EXECUTE SIGNAL — SCALP VERSION ✅
+# ============================================================================
+
+def execute_signal(signal):
+    signal_id = signal["signal_id"]
+    direction = signal["direction"]
+
+    with state_lock:
+        already_consumed = state.get("signal_consumed") is True and state.get("last_signal_id") == signal_id
+
+    if already_consumed:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "SIGNAL_ALREADY_CONSUMED"
+        }
+
+    existing_position = get_active_position(signal_id)
+    if existing_position:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "POSITION_ALREADY_EXISTS"
+        }
+
+    with state_lock:
+        if state.get("last_signal_id") == signal_id and state.get("entry_confirmed"):
+            return {
+                "accepted": False,
+                "status": "DUPLICATE_SIGNAL",
+                "signal_id": signal_id
+            }
+
+    has_position, position = has_open_position_for_symbol()
+    if has_position:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "POSITION_ALREADY_EXISTS"
+        }
+
+    has_order, order = has_open_orders_for_symbol()
+    if has_order:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "OPEN_ORDER_EXISTS"
+        }
+
+    if not TRADING_ENABLED or not ORDERS_ENABLED:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "TRADING_DISABLED"
+        }
+
+    display_signal(signal)
+
+    append_jsonl(SIGNAL_LOG_FILE, {
+        "received_at": iso_now(),
+        "signal": signal
+    })
+
+    send_webhook_to_bot("SIGNAL_RECEIVED", {
+        "signal_id": signal_id,
+        "direction": direction,
+        "reference_entry": signal.get("reference_entry")
+    })
+
+    with state_lock:
+        state["connected_to_bot"] = True
+        state["last_signal_time"] = iso_now()
+        state["execution_status"] = "SIGNAL_RECEIVED"
+
+    save_state()
+
+    if not LIVE_ORDER_EXECUTION or not state.get("xt_private_ready"):
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "LIVE_EXECUTION_DISABLED"
+        }
+
+    r_value = float(signal["initial_risk"])
+    entry = float(signal["reference_entry"])
+    
+    # ✅ محاسبه استاپ (1R) و TP (0.5R)
+    final_stop = entry - (r_value * STOP_R_MULTIPLE) if direction == "LONG" else entry + (r_value * STOP_R_MULTIPLE)
+    tp_price = entry + (r_value * TP_FULL_R) if direction == "LONG" else entry - (r_value * TP_FULL_R)
+
+    if final_stop <= 0 or tp_price <= 0:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "INVALID_PRICES"
+        }
+
+    # ✅ محاسبه حجم بر اساس ریسک ثابت
+    quantity_info = get_order_quantity(entry, final_stop, direction)
+    total_quantity = quantity_info["quantity"]
+
+    if total_quantity <= 0:
+        with state_lock:
+            state["execution_status"] = "INVALID_ORDER_QUANTITY"
+        save_state()
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "INVALID_ORDER_QUANTITY"
+        }
+
+    print()
+    print("📊 SCALP PRICES:")
+    print(f"   ENTRY : {entry:.4f}")
+    print(f"   STOP  : {final_stop:.4f} (1R)")
+    print(f"   TP    : {tp_price:.4f} (0.5R) ✅ 100% position")
+    print(f"   RISK  : {FIXED_RISK_USDT}$")
+    print()
+
+    try:
+        print("🔥 SENDING REAL XT MARKET ENTRY...")
+
+        entry_response = xt.create_market_entry(direction, total_quantity)
+        entry_order_id = extract_order_id(entry_response)
+
+        if entry_order_id is None:
+            raise RuntimeError(f"Order ID could not be extracted: {entry_response}")
+
+        with state_lock:
+            state["last_signal_id"] = signal_id
+            state["entry_confirmed"] = True
+            state["signal_consumed"] = True
+            state["execution_status"] = "ENTRY_CONFIRMED"
+
+        save_state()
+
+    except Exception as exc:
+        with state_lock:
+            state["execution_status"] = "ENTRY_REJECTED"
+        save_state()
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "ENTRY_REJECTED",
+            "error": str(exc)
+        }
+
+    # ✅ تایید پوزیشن
+    print("VERIFYING ACTUAL XT POSITION...")
+    actual = None
+    for attempt in range(15):
+        try:
+            position_response = xt.get_position()
+            positions = extract_positions(position_response)
+            actual = find_active_position(positions)
+            if actual:
+                print(f"XT POSITION CONFIRMED (attempt {attempt+1})")
+                break
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    if actual is None:
+        with state_lock:
+            state["execution_status"] = "POSITION_VERIFY_FAILED"
+        save_state()
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "POSITION_VERIFY_FAILED"
+        }
+
+    actual_size = float(actual.get("positionSize", 0) or 0)
+    entry_price = float(actual.get("entryPrice", 0) or 0)
+
+    if entry_price <= 0 or actual_size <= 0:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "INVALID_POSITION"
+        }
+
+    # ✅ محاسبه مجدد با قیمت واقعی
+    r_value = float(signal["initial_risk"])
+    final_stop = entry_price - (r_value * STOP_R_MULTIPLE) if direction == "LONG" else entry_price + (r_value * STOP_R_MULTIPLE)
+    tp_price = entry_price + (r_value * TP_FULL_R) if direction == "LONG" else entry_price - (r_value * TP_FULL_R)
+
+    # ✅ ایجاد استاپ (1R)
+    stop_response = xt.create_stop_market(direction, actual_size, final_stop)
+    stop_order_id = extract_order_id(stop_response)
+
+    if stop_order_id is None:
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "STOP_FAILED"
+        }
+
+    # ✅ ایجاد TP (0.5R - 100% پوزیشن)
+    tp_response = xt.create_take_profit_limit(direction, actual_size, tp_price, reduce_only=True)
+    tp_order_id = extract_order_id(tp_response)
+
+    if tp_order_id is None:
+        try:
+            xt.cancel_order(stop_order_id)
+        except:
+            pass
+        return {
+            "accepted": False,
+            "signal_id": signal_id,
+            "status": "TP_FAILED"
+        }
+
+    position_data = {
+        "signal_id": signal_id,
+        "direction": direction,
+        "quantity": actual_size,
+        "entry": entry_price,
+        "risk_R": r_value,
+        "stop": final_stop,
+        "tp": tp_price,
+        "stop_order_id": stop_order_id,
+        "tp_order_id": tp_order_id,
+        "management_stage": 0
+    }
+
+    add_active_position(signal_id, position_data)
+
+    start_position_manager()
+
+    print()
+    print("=" * 78)
+    print(f"🔥 POSITION ACTIVE - SCALP ({DISPLAY_SYMBOL})")
+    print("=" * 78)
+    print(f"SIGNAL ID        : {signal_id}")
+    print(f"POSITION         : {direction}")
+    print(f"ENTRY            : {entry_price:.4f}")
+    print(f"STOP             : {final_stop:.4f} (1R)")
+    print(f"TP               : {tp_price:.4f} (0.5R) ✅ 100% position")
+    print(f"MAX RISK         : {FIXED_RISK_USDT}$")
+    print(f"STOP ORDER ID    : {stop_order_id}")
+    print(f"TP ORDER ID      : {tp_order_id}")
+    print("=" * 78)
+    print()
+
+    return {
+        "accepted": True,
+        "ack": True,
+        "signal_id": signal_id,
+        "status": "POSITION_ACTIVE",
+        "entry_order_id": entry_order_id,
+        "stop_order_id": stop_order_id,
+        "tp_order_id": tp_order_id
+    }
+
+
+# ============================================================================
+# HTTP HANDLER
+# ============================================================================
+
+class SignalHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args):
+        return
+
+    def send_json(self, status_code, payload):
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        if self.path == "/health":
+            with state_lock:
+                positions = get_all_active_positions()
+                payload = {
+                    "platform": "REZA EXECUTION PLATFORM",
+                    "version": VERSION,
+                    "bot_version": BOT_VERSION,
+                    "symbol": DISPLAY_SYMBOL,
+                    "status": "ONLINE",
+                    "mode": "SCALP",
+                    "stop_r": STOP_R_MULTIPLE,
+                    "tp_r": TP_FULL_R,
+                    "fixed_risk_usdt": FIXED_RISK_USDT,
+                    "active_positions_count": len(positions),
+                    "execution_status": state.get("execution_status")
+                }
+            self.send_json(200, payload)
+            return
+        self.send_json(404, {"error": "NOT_FOUND"})
+
+    def do_POST(self):
+        if self.path != BOT_SIGNAL_PATH:
+            self.send_json(404, {"accepted": False, "error": "NOT_FOUND"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            signal = json.loads(raw.decode("utf-8"))
+            validate_signal(signal)
+            result = execute_signal(signal)
+            self.send_json(200, result)
+        except Exception as exc:
+            self.send_json(400, {
+                "accepted": False,
+                "status": "REJECTED",
+                "error": str(exc)
+            })
+
+
+# ============================================================================
+# SERVER
+# ============================================================================
+
+server = None
+
+
+class ReusableThreadingTCPServer(ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_signal_server():
+    global server
+
+    try:
+        server = ReusableThreadingTCPServer(
+            (PLATFORM_HOST, PLATFORM_PORT),
+            SignalHandler
+        )
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 98:
+            print()
+            print("=" * 78)
+            print(f"⚠️ PORT {PLATFORM_PORT} IS ALREADY IN USE")
+            print("=" * 78)
+            with state_lock:
+                state["listener_owner"] = "EXISTING_INSTANCE"
+            save_state()
+            return False
+        raise
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="REZA-PLATFORM-LISTENER-XRP-SCALP"
+    )
+    thread.start()
+
+    with state_lock:
+        state["listener_owner"] = f"{PLATFORM_HOST}:{PLATFORM_PORT}"
+    save_state()
+
+    print()
+    print("=" * 78)
+    print("BOT SIGNAL SERVER - SCALP (XRP)")
+    print("=" * 78)
+    print(f"SIGNAL             : http://{PLATFORM_HOST}:{PLATFORM_PORT}{BOT_SIGNAL_PATH}")
+    print(f"HEALTH             : http://{PLATFORM_HOST}:{PLATFORM_PORT}/health")
+    print("=" * 78)
+
+    return True
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    global xt
+
+    ensure_data_dir()
+    load_active_positions()
+
+    if not load_configuration():
+        first_run_configuration()
+
+    validate_configuration()
+    load_state()
+
+    print()
+    print("=" * 78)
+    print(f"REZA EXECUTION PLATFORM {VERSION} — {DISPLAY_SYMBOL} (SCALP) ✅")
+    print("=" * 78)
+    print(f"   - STOP        : 1R (Fixed)")
+    print(f"   - TP          : 0.5R (100% position)")
+    print(f"   - Breakeven   : 0.3R (Stop -> Entry)")
+    print(f"   - FIXED RISK  : {FIXED_RISK_USDT}$ per trade")
+    print("=" * 78)
+
+    xt = XTClient(
+        config["api_key"],
+        config["api_secret"]
+    )
+
+    test_xt_connection()
+
+    listener_started = start_signal_server()
+
+    print()
+    print("=" * 78)
+    print("PLATFORM STATUS")
+    print("=" * 78)
+    print(f"BOT CONNECTION     : {'LISTENING' if listener_started else 'EXISTING'}")
+    print(f"XT PRIVATE API     : {'OK' if state.get('xt_private_ready') else 'PARTIAL'}")
+    print(f"XT AVAILABLE USDT  : {state.get('xt_balance')}")
+    print("MODEL              : SCALP (SINGLE TP)")
+    print(f"FIXED RISK         : {FIXED_RISK_USDT}$")
+    print("=" * 78)
+
+    print()
+    print("📌 SCALP MODE ACTIVE (XRP):")
+    print(f"   - STOP  : 1R (Fixed)")
+    print(f"   - TP    : 0.5R (100% position) ✅")
+    print(f"   - Breakeven: 0.3R (Stop -> Entry)")
+    print(f"   - Risk  : {FIXED_RISK_USDT}$ per trade")
+    print()
+
+    while True:
+        time.sleep(1)
+
+
+# ============================================================================
+# ENTRY
+# ============================================================================
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print(f"REZA EXECUTION PLATFORM {DISPLAY_SYMBOL} (SCALP) STOPPED.")
+    except Exception as exc:
+        print()
+        print("=" * 78)
+        print("FATAL ERROR")
+        print("=" * 78)
+        print(f"{type(exc).__name__}: {exc}")
+        print("=" * 78)
